@@ -12,7 +12,7 @@ import httpx
 from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel, Field
 
-BUILD_TAG = "2026-08-14-elevenlabs-forced-alignment-v2"
+BUILD_TAG = "2026-08-14-elevenlabs-forced-alignment-v3"
 PROVIDER = "elevenlabs_forced_alignment"
 PROVIDER_API = "https://api.elevenlabs.io/v1/forced-alignment"
 MAX_WORDS = int(os.getenv("ALIGNMENT_MAX_WORDS", "50000"))
@@ -22,6 +22,8 @@ REQUEST_CONCURRENCY = max(1, int(os.getenv("ALIGNMENT_MAX_CONCURRENCY", "1")))
 CHUNK_SECONDS = min(290, max(30, int(os.getenv("ALIGNMENT_CHUNK_SECONDS", "240"))))
 CHUNK_PADDING_SECONDS = min(15, max(2, int(os.getenv("ALIGNMENT_CHUNK_PADDING_SECONDS", "5"))))
 CHUNK_MAX_CHARS = max(1000, int(os.getenv("ALIGNMENT_CHUNK_MAX_CHARS", "18000")))
+MAX_REGRESSION_MS = max(250, int(os.getenv("ALIGNMENT_MAX_REGRESSION_MS", "10000")))
+MAX_REPAIR_RATIO = min(0.05, max(0.001, float(os.getenv("ALIGNMENT_MAX_REPAIR_RATIO", "0.01"))))
 SHARED_SECRET = os.getenv("ALIGNMENT_SHARED_SECRET", "")
 ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY", "")
 SUPPORTED_LANGUAGES = {"en", "ja", "zh", "de", "hi", "fr", "ko", "pt", "it", "es", "id", "nl", "tr", "fil", "pl", "sv", "bg", "ro", "ar", "cs", "el", "fi", "hr", "ms", "sk", "da", "ta", "uk", "ru"}
@@ -72,19 +74,52 @@ def chunk_words(words: list[InputWord]) -> list[list[InputWord]]:
     chunks: list[list[InputWord]] = []
     current: list[InputWord] = []
     chars = 0
+    current_end_ms = 0.0
     for word in words:
         proposed_chars = chars + len(word.text) + 1
-        proposed_duration = 0 if not current else (word.provider_end_ms - current[0].provider_start_ms) / 1000
-        overlaps_current = bool(current and word.provider_start_ms < current[-1].provider_end_ms)
-        if current and (overlaps_current or proposed_duration > CHUNK_SECONDS or proposed_chars > CHUNK_MAX_CHARS):
+        proposed_end_ms = max(current_end_ms, word.provider_end_ms)
+        proposed_duration = 0 if not current else (proposed_end_ms - current[0].provider_start_ms) / 1000
+        if current and (proposed_duration > CHUNK_SECONDS or proposed_chars > CHUNK_MAX_CHARS):
             chunks.append(current)
             current = []
             chars = 0
+            current_end_ms = 0.0
         current.append(word)
         chars += len(word.text) + 1
+        current_end_ms = max(current_end_ms, word.provider_end_ms)
     if current:
         chunks.append(current)
     return chunks
+
+
+def normalize_aligned_timeline(words: list[dict]) -> tuple[list[dict], int, int]:
+    normalized: list[dict] = []
+    previous_start_by_stream: dict[str, int] = {}
+    repair_count = 0
+    max_regression_ms = 0
+    repair_limit = max(2, int(len(words) * MAX_REPAIR_RATIO))
+    for source in words:
+        word = dict(source)
+        stream_key = word["key"].rsplit(":", 1)[0]
+        previous_start = previous_start_by_stream.get(stream_key, -1)
+        if word["start_ms"] < previous_start:
+            regression_ms = previous_start - word["start_ms"]
+            if regression_ms > MAX_REGRESSION_MS:
+                raise ValueError(f"Alignment regression exceeds safety bound at {word['key']}: {regression_ms}ms")
+            repair_count += 1
+            if repair_count > repair_limit:
+                raise ValueError(f"Alignment repair ratio exceeds safety bound at {word['key']}")
+            duration_ms = max(1, word["end_ms"] - word["start_ms"])
+            word["raw_start_ms"] = word["start_ms"]
+            word["raw_end_ms"] = word["end_ms"]
+            word["start_ms"] = previous_start
+            word["end_ms"] = previous_start + duration_ms
+            word["confidence"] = 0.0
+            word["timing_repaired"] = True
+            max_regression_ms = max(max_regression_ms, regression_ms)
+        previous_start_by_stream[stream_key] = word["start_ms"]
+        normalized.append(word)
+    return normalized, repair_count, max_regression_ms
 
 
 def extract_chunk(source: Path, target: Path, start_seconds: float, duration_seconds: float):
@@ -190,8 +225,8 @@ async def align(payload: AlignmentRequest, x_alignment_secret: str = Header(defa
                 timeout = httpx.Timeout(600, connect=30)
                 async with httpx.AsyncClient(timeout=timeout) as client:
                     for index, group in enumerate(groups):
-                        start_ms = max(0, int(group[0].provider_start_ms - CHUNK_PADDING_SECONDS * 1000))
-                        end_ms = int(group[-1].provider_end_ms + CHUNK_PADDING_SECONDS * 1000)
+                        start_ms = max(0, int(min(word.provider_start_ms for word in group) - CHUNK_PADDING_SECONDS * 1000))
+                        end_ms = int(max(word.provider_end_ms for word in group) + CHUNK_PADDING_SECONDS * 1000)
                         chunk_path = Path(tmp) / f"chunk-{index:05d}.flac"
                         await asyncio.to_thread(extract_chunk, source, chunk_path, start_ms / 1000, max(1.0, (end_ms - start_ms) / 1000))
                         chunk_aligned, loss = await align_chunk(client, chunk_path, group, start_ms)
@@ -199,13 +234,7 @@ async def align(payload: AlignmentRequest, x_alignment_secret: str = Header(defa
                         losses.append(loss)
         if len(aligned) != len(payload.words):
             raise ValueError("Alignment result is incomplete")
-        aligned_start_by_stream: dict[str, int] = {}
-        for word in aligned:
-            stream_key = word["key"].rsplit(":", 1)[0]
-            previous_start = aligned_start_by_stream.get(stream_key, -1)
-            if word["start_ms"] < previous_start:
-                raise ValueError(f"Regressive alignment at {word['key']}")
-            aligned_start_by_stream[stream_key] = word["start_ms"]
+        aligned, timing_repair_count, max_regression_ms = normalize_aligned_timeline(aligned)
         shifts = [max(abs(w["start_ms"] - w["provider_start_ms"]), abs(w["end_ms"] - w["provider_end_ms"])) for w in aligned]
         mean_loss = sum(losses) / len(losses)
         response = {
@@ -221,6 +250,8 @@ async def align(payload: AlignmentRequest, x_alignment_secret: str = Header(defa
             "word_count": len(aligned),
             "mean_confidence": max(0.0, min(1.0, 1.0 - mean_loss)),
             "max_provider_shift_ms": max(shifts, default=0),
+            "timing_repair_count": timing_repair_count,
+            "max_regression_ms": max_regression_ms,
             "duration_ms": round((time.monotonic() - started) * 1000),
             "chunk_count": len(groups),
             "request_hash": hashlib.sha256(json.dumps([word.model_dump() for word in payload.words], sort_keys=True).encode()).hexdigest(),
