@@ -12,7 +12,7 @@ import httpx
 from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel, Field
 
-BUILD_TAG = "2026-08-14-elevenlabs-forced-alignment-v3"
+BUILD_TAG = "2026-08-14-elevenlabs-forced-alignment-v4-distribution-gate"
 PROVIDER = "elevenlabs_forced_alignment"
 PROVIDER_API = "https://api.elevenlabs.io/v1/forced-alignment"
 MAX_WORDS = int(os.getenv("ALIGNMENT_MAX_WORDS", "50000"))
@@ -24,6 +24,13 @@ CHUNK_PADDING_SECONDS = min(15, max(2, int(os.getenv("ALIGNMENT_CHUNK_PADDING_SE
 CHUNK_MAX_CHARS = max(1000, int(os.getenv("ALIGNMENT_CHUNK_MAX_CHARS", "18000")))
 MAX_REGRESSION_MS = max(250, int(os.getenv("ALIGNMENT_MAX_REGRESSION_MS", "10000")))
 MAX_REPAIR_RATIO = min(0.05, max(0.001, float(os.getenv("ALIGNMENT_MAX_REPAIR_RATIO", "0.01"))))
+# Per-word tolerance used to CLASSIFY a provider disagreement as an outlier.
+# It is a measurement threshold only — the release decision lives in the worker
+# gate, which fails closed on SYSTEMIC drift (p99 + outlier ratio) instead of a
+# single worst word. A 45-minute program holds ~8,000 words; one provider
+# timestamp outlier must never veto an otherwise fully verified alignment.
+OUTLIER_TOLERANCE_MS = max(1_000, int(os.getenv("ALIGNMENT_OUTLIER_TOLERANCE_MS", "30000")))
+MAX_OUTLIER_SAMPLE = 25
 SHARED_SECRET = os.getenv("ALIGNMENT_SHARED_SECRET", "")
 ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY", "")
 SUPPORTED_LANGUAGES = {"en", "ja", "zh", "de", "hi", "fr", "ko", "pt", "it", "es", "id", "nl", "tr", "fil", "pl", "sv", "bg", "ro", "ar", "cs", "el", "fi", "hr", "ms", "sk", "da", "ta", "uk", "ru"}
@@ -120,6 +127,43 @@ def normalize_aligned_timeline(words: list[dict]) -> tuple[list[dict], int, int]
         previous_start_by_stream[stream_key] = word["start_ms"]
         normalized.append(word)
     return normalized, repair_count, max_regression_ms
+
+
+def percentile(sorted_values: list[int], fraction: float) -> int:
+    if not sorted_values:
+        return 0
+    index = int(round((len(sorted_values) - 1) * fraction))
+    return sorted_values[max(0, min(len(sorted_values) - 1, index))]
+
+
+def shift_distribution(aligned: list[dict]) -> dict:
+    """Provider-vs-acoustic disagreement as a DISTRIBUTION, not a single max.
+
+    Returns the max (kept verbatim as evidence), the median/p95/p99, the count
+    and ratio of words beyond OUTLIER_TOLERANCE_MS, and a bounded sample of the
+    worst offenders so an auditor can inspect exactly which words disagreed and
+    by how much. Systemic drift moves p99; an isolated bad provider timestamp
+    only moves max.
+    """
+    shifts: list[tuple[int, str]] = []
+    for word in aligned:
+        shift = max(
+            abs(word["start_ms"] - word["provider_start_ms"]),
+            abs(word["end_ms"] - word["provider_end_ms"]),
+        )
+        shifts.append((int(shift), str(word["key"])))
+    values = sorted(value for value, _ in shifts)
+    outliers = sorted((entry for entry in shifts if entry[0] > OUTLIER_TOLERANCE_MS), reverse=True)
+    return {
+        "max_provider_shift_ms": values[-1] if values else 0,
+        "median_provider_shift_ms": percentile(values, 0.5),
+        "p95_provider_shift_ms": percentile(values, 0.95),
+        "p99_provider_shift_ms": percentile(values, 0.99),
+        "outlier_tolerance_ms": OUTLIER_TOLERANCE_MS,
+        "outlier_word_count": len(outliers),
+        "outlier_ratio": (len(outliers) / len(values)) if values else 0.0,
+        "outlier_sample": [{"key": key, "shift_ms": value} for value, key in outliers[:MAX_OUTLIER_SAMPLE]],
+    }
 
 
 def extract_chunk(source: Path, target: Path, start_seconds: float, duration_seconds: float):
@@ -235,7 +279,7 @@ async def align(payload: AlignmentRequest, x_alignment_secret: str = Header(defa
         if len(aligned) != len(payload.words):
             raise ValueError("Alignment result is incomplete")
         aligned, timing_repair_count, max_regression_ms = normalize_aligned_timeline(aligned)
-        shifts = [max(abs(w["start_ms"] - w["provider_start_ms"]), abs(w["end_ms"] - w["provider_end_ms"])) for w in aligned]
+        distribution = shift_distribution(aligned)
         mean_loss = sum(losses) / len(losses)
         response = {
             "ok": True,
@@ -249,7 +293,7 @@ async def align(payload: AlignmentRequest, x_alignment_secret: str = Header(defa
             "audio_sha256": audio_sha256,
             "word_count": len(aligned),
             "mean_confidence": max(0.0, min(1.0, 1.0 - mean_loss)),
-            "max_provider_shift_ms": max(shifts, default=0),
+            **distribution,
             "timing_repair_count": timing_repair_count,
             "max_regression_ms": max_regression_ms,
             "duration_ms": round((time.monotonic() - started) * 1000),
