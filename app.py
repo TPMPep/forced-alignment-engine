@@ -12,7 +12,7 @@ import httpx
 from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel, Field
 
-BUILD_TAG = "2026-08-14-elevenlabs-forced-alignment-v4-distribution-gate"
+BUILD_TAG = "2026-08-14-elevenlabs-forced-alignment-v5-silence-bounded-chunks"
 PROVIDER = "elevenlabs_forced_alignment"
 PROVIDER_API = "https://api.elevenlabs.io/v1/forced-alignment"
 MAX_WORDS = int(os.getenv("ALIGNMENT_MAX_WORDS", "50000"))
@@ -20,7 +20,32 @@ MAX_AUDIO_BYTES = int(os.getenv("ALIGNMENT_MAX_AUDIO_BYTES", str(8 * 1024**3)))
 DOWNLOAD_TIMEOUT_SECONDS = int(os.getenv("ALIGNMENT_DOWNLOAD_TIMEOUT_SECONDS", "1800"))
 REQUEST_CONCURRENCY = max(1, int(os.getenv("ALIGNMENT_MAX_CONCURRENCY", "1")))
 CHUNK_SECONDS = min(290, max(30, int(os.getenv("ALIGNMENT_CHUNK_SECONDS", "240"))))
-CHUNK_PADDING_SECONDS = min(15, max(2, int(os.getenv("ALIGNMENT_CHUNK_PADDING_SECONDS", "5"))))
+# Padding exists ONLY to avoid clipping a word at a chunk edge. It is deliberately
+# TIGHT because every padded second is audio the aligner must account for but has
+# no transcript for — i.e. absorbable time. 5s of padding on both edges was itself
+# a 10s absorption budget per chunk; 2s is ample to protect a word onset/offset.
+CHUNK_PADDING_SECONDS = min(15, max(1, int(os.getenv("ALIGNMENT_CHUNK_PADDING_SECONDS", "2"))))
+# ─── The absorption fix (root cause, not a repair) ──────────────────────────────
+# Forced alignment must account for EVERY millisecond of audio it is given. If a
+# chunk's audio window spans a stretch with no transcript — music, atmosphere,
+# unintelligible overlap — the aligner has nowhere to put that time and stuffs it
+# into the neighbouring words, either inside one word or across the gaps between
+# them. Ground truth (project 6a6c561ef670f3992db756d0): "¿Aita, estás bien?" —
+# 670ms of speech in the provider capture — was aligned across 28,200ms, because
+# its chunk spanned a long non-dialogue stretch.
+#
+# Chunking previously split ONLY on accumulated duration (240s) or characters, so
+# a single chunk routinely straddled minutes of silence. Splitting additionally at
+# any provider-measured gap too long to be speech means every chunk's audio window
+# tightly bounds real dialogue, and there is no untranscribed audio inside it to
+# absorb. The defect becomes structurally impossible rather than something we
+# detect and repair afterwards.
+#
+# 2000ms is well clear of natural speech rhythm (the segment shaper treats 650ms as
+# a breath and 300ms as a pause), so this never fractures a continuous utterance —
+# it only cuts where the provider itself measured a non-speech span. Residual
+# absorption is bounded by the padding above.
+CHUNK_MAX_SPEECH_GAP_MS = max(500, int(os.getenv("ALIGNMENT_CHUNK_MAX_SPEECH_GAP_MS", "2000")))
 CHUNK_MAX_CHARS = max(1000, int(os.getenv("ALIGNMENT_CHUNK_MAX_CHARS", "18000")))
 MAX_REGRESSION_MS = max(250, int(os.getenv("ALIGNMENT_MAX_REGRESSION_MS", "10000")))
 MAX_REPAIR_RATIO = min(0.05, max(0.001, float(os.getenv("ALIGNMENT_MAX_REPAIR_RATIO", "0.01"))))
@@ -86,7 +111,11 @@ def chunk_words(words: list[InputWord]) -> list[list[InputWord]]:
         proposed_chars = chars + len(word.text) + 1
         proposed_end_ms = max(current_end_ms, word.provider_end_ms)
         proposed_duration = 0 if not current else (proposed_end_ms - current[0].provider_start_ms) / 1000
-        if current and (proposed_duration > CHUNK_SECONDS or proposed_chars > CHUNK_MAX_CHARS):
+        # Gap to the previous word, as MEASURED BY THE PROVIDER. A gap this long is
+        # not speech rhythm — it is audio with no transcript, which is exactly what
+        # the aligner would otherwise absorb into a neighbouring word.
+        speech_gap_ms = 0.0 if not current else (word.provider_start_ms - current_end_ms)
+        if current and (proposed_duration > CHUNK_SECONDS or proposed_chars > CHUNK_MAX_CHARS or speech_gap_ms > CHUNK_MAX_SPEECH_GAP_MS):
             chunks.append(current)
             current = []
             chars = 0
@@ -235,6 +264,8 @@ async def health():
         "provider": PROVIDER,
         "max_concurrency": REQUEST_CONCURRENCY,
         "chunk_seconds": CHUNK_SECONDS,
+        "chunk_max_speech_gap_ms": CHUNK_MAX_SPEECH_GAP_MS,
+        "chunk_padding_seconds": CHUNK_PADDING_SECONDS,
         "supported_language_count": len(SUPPORTED_LANGUAGES),
     }
 
