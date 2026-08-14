@@ -12,7 +12,7 @@ import httpx
 from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel, Field
 
-BUILD_TAG = "2026-08-13-elevenlabs-forced-alignment-v1"
+BUILD_TAG = "2026-08-14-elevenlabs-forced-alignment-v2"
 PROVIDER = "elevenlabs_forced_alignment"
 PROVIDER_API = "https://api.elevenlabs.io/v1/forced-alignment"
 MAX_WORDS = int(os.getenv("ALIGNMENT_MAX_WORDS", "50000"))
@@ -199,13 +199,13 @@ async def align(payload: AlignmentRequest, x_alignment_secret: str = Header(defa
                         losses.append(loss)
         if len(aligned) != len(payload.words):
             raise ValueError("Alignment result is incomplete")
-        aligned_cursor_by_segment: dict[str, int] = {}
+        aligned_start_by_stream: dict[str, int] = {}
         for word in aligned:
-            segment_key = word["key"].rsplit(":", 1)[0]
-            previous_end = aligned_cursor_by_segment.get(segment_key, -1)
-            if word["start_ms"] < previous_end:
-                raise ValueError(f"Non-monotonic alignment at {word['key']}")
-            aligned_cursor_by_segment[segment_key] = word["end_ms"]
+            stream_key = word["key"].rsplit(":", 1)[0]
+            previous_start = aligned_start_by_stream.get(stream_key, -1)
+            if word["start_ms"] < previous_start:
+                raise ValueError(f"Regressive alignment at {word['key']}")
+            aligned_start_by_stream[stream_key] = word["start_ms"]
         shifts = [max(abs(w["start_ms"] - w["provider_start_ms"]), abs(w["end_ms"] - w["provider_end_ms"])) for w in aligned]
         mean_loss = sum(losses) / len(losses)
         response = {
