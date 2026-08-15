@@ -10,6 +10,9 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY app.py .
+# app.py imports the policy modules (plausibility, adaptive expansion) from here.
+# Tests are intentionally NOT copied — they are a CI artifact, not a runtime one.
+COPY services ./services
 
 RUN useradd --create-home --uid 10001 aligner && chown -R aligner:aligner /app
 USER aligner
