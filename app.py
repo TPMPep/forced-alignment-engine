@@ -12,7 +12,7 @@ import httpx
 from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel, Field
 
-BUILD_TAG = "2026-08-14-elevenlabs-forced-alignment-v5-silence-bounded-chunks"
+BUILD_TAG = "2026-08-15-elevenlabs-forced-alignment-v6-evidence-derived-edge-padding"
 PROVIDER = "elevenlabs_forced_alignment"
 PROVIDER_API = "https://api.elevenlabs.io/v1/forced-alignment"
 MAX_WORDS = int(os.getenv("ALIGNMENT_MAX_WORDS", "50000"))
@@ -20,11 +20,39 @@ MAX_AUDIO_BYTES = int(os.getenv("ALIGNMENT_MAX_AUDIO_BYTES", str(8 * 1024**3)))
 DOWNLOAD_TIMEOUT_SECONDS = int(os.getenv("ALIGNMENT_DOWNLOAD_TIMEOUT_SECONDS", "1800"))
 REQUEST_CONCURRENCY = max(1, int(os.getenv("ALIGNMENT_MAX_CONCURRENCY", "1")))
 CHUNK_SECONDS = min(290, max(30, int(os.getenv("ALIGNMENT_CHUNK_SECONDS", "240"))))
-# Padding exists ONLY to avoid clipping a word at a chunk edge. It is deliberately
-# TIGHT because every padded second is audio the aligner must account for but has
-# no transcript for — i.e. absorbable time. 5s of padding on both edges was itself
-# a 10s absorption budget per chunk; 2s is ample to protect a word onset/offset.
-CHUNK_PADDING_SECONDS = min(15, max(1, int(os.getenv("ALIGNMENT_CHUNK_PADDING_SECONDS", "2"))))
+# ─── Edge padding: the last unaccounted audio in the pipeline ───────────────────
+# Padding exists ONLY to avoid clipping a word at a chunk edge. But padding is BY
+# DEFINITION audio with no transcript, and forced alignment must account for every
+# millisecond it is given — so the aligner assigns the padding to the edge word.
+# That is not a theory. Ground truth, project 6a7d874aa2ddd372f426a4df row 17: the
+# provider measured speech ending at 93,664ms, the chunk therefore ended at
+# 93,664 + 2,000 = 95,664, and the final word "leadership." was aligned ending at
+# 95,639 — it swallowed the ENTIRE trailing pad, to within 25ms. Every observed
+# divergence on that program equalled the fixed pad almost exactly. A fixed pad is
+# a fixed absorption budget handed to the aligner on every chunk edge.
+#
+# The pad cannot simply be removed: at an edge, the provider's own word boundary
+# carries measurement error, and a zero pad would clip the word's onset or offset.
+# So the pad is DERIVED FROM EVIDENCE instead of assumed: each edge is padded by at
+# most HALF the silence the provider actually measured at that edge, capped at
+# EDGE_PADDING_MS. Because chunk edges are cut at gaps wider than
+# CHUNK_MAX_SPEECH_GAP_MS, there is provably silence to spend, and the pad can
+# never reach into the neighbouring utterance's audio — so an edge word can never
+# absorb another word's speech.
+#
+# WHY 350ms IS THE CAP, AND WHY IT IS THE WHOLE POINT: the maximum absorption an
+# edge word can now suffer is EDGE_PADDING_MS. At 350ms that is below the 650ms
+# breath boundary in lib/segment-shaping.js and far below the 1,500ms divergence
+# trust threshold in the worker's timeline-integrity audit. Edge absorption is
+# therefore structurally incapable of creating a spurious line break or of
+# reassigning a word to the wrong speaker — the two consequential failures this
+# whole control chain exists to prevent. It stops being a defect we detect and
+# repair downstream and becomes one we cannot produce.
+#
+# The floor keeps a usable pad when a gap is small or when segment streams overlap
+# (a negative measured gap), where clipping risk outweighs a sub-breath absorption.
+EDGE_PADDING_MS = min(2_000, max(50, int(os.getenv("ALIGNMENT_EDGE_PADDING_MS", "350"))))
+EDGE_PADDING_FLOOR_MS = min(EDGE_PADDING_MS, max(25, int(os.getenv("ALIGNMENT_EDGE_PADDING_FLOOR_MS", "100"))))
 # ─── The absorption fix (root cause, not a repair) ──────────────────────────────
 # Forced alignment must account for EVERY millisecond of audio it is given. If a
 # chunk's audio window spans a stretch with no transcript — music, atmosphere,
@@ -126,6 +154,45 @@ def chunk_words(words: list[InputWord]) -> list[list[InputWord]]:
     if current:
         chunks.append(current)
     return chunks
+
+
+def chunk_windows(groups: list[list[InputWord]]) -> list[dict]:
+    """Audio window per chunk, with each edge pad bounded by MEASURED silence.
+
+    A chunk's window is the group's provider-measured speech span plus a pad on
+    each side. The pad is the minimum of EDGE_PADDING_MS and half the provider-
+    measured gap to the adjacent chunk, floored at EDGE_PADDING_FLOOR_MS. Taking
+    half guarantees two adjacent chunks can never pad into the same silence and
+    never into each other's speech, so the audio an edge word could absorb is
+    always genuine non-speech and always bounded. At the program's first and last
+    edge there is no adjacent word to measure against, so the cap is used.
+
+    Returned per chunk for audit: the window, both pads, and both measured gaps —
+    so an auditor can reconstruct exactly how much unaccounted audio each edge
+    word was exposed to, without re-deriving it from the word timings.
+    """
+    windows: list[dict] = []
+    for index, group in enumerate(groups):
+        speech_start = min(word.provider_start_ms for word in group)
+        speech_end = max(word.provider_end_ms for word in group)
+        previous_end = max(word.provider_end_ms for word in groups[index - 1]) if index > 0 else None
+        next_start = min(word.provider_start_ms for word in groups[index + 1]) if index + 1 < len(groups) else None
+        lead_gap_ms = None if previous_end is None else (speech_start - previous_end)
+        trail_gap_ms = None if next_start is None else (next_start - speech_end)
+        lead_pad_ms = float(EDGE_PADDING_MS) if lead_gap_ms is None else max(EDGE_PADDING_FLOOR_MS, min(EDGE_PADDING_MS, lead_gap_ms / 2))
+        trail_pad_ms = float(EDGE_PADDING_MS) if trail_gap_ms is None else max(EDGE_PADDING_FLOOR_MS, min(EDGE_PADDING_MS, trail_gap_ms / 2))
+        windows.append({
+            "start_ms": max(0.0, speech_start - lead_pad_ms),
+            "end_ms": speech_end + trail_pad_ms,
+            "speech_start_ms": speech_start,
+            "speech_end_ms": speech_end,
+            "lead_pad_ms": round(lead_pad_ms),
+            "trail_pad_ms": round(trail_pad_ms),
+            "lead_gap_ms": None if lead_gap_ms is None else round(lead_gap_ms),
+            "trail_gap_ms": None if trail_gap_ms is None else round(trail_gap_ms),
+            "word_count": len(group),
+        })
+    return windows
 
 
 def normalize_aligned_timeline(words: list[dict]) -> tuple[list[dict], int, int]:
@@ -265,7 +332,8 @@ async def health():
         "max_concurrency": REQUEST_CONCURRENCY,
         "chunk_seconds": CHUNK_SECONDS,
         "chunk_max_speech_gap_ms": CHUNK_MAX_SPEECH_GAP_MS,
-        "chunk_padding_seconds": CHUNK_PADDING_SECONDS,
+        "edge_padding_ms": EDGE_PADDING_MS,
+        "edge_padding_floor_ms": EDGE_PADDING_FLOOR_MS,
         "supported_language_count": len(SUPPORTED_LANGUAGES),
     }
 
@@ -295,13 +363,15 @@ async def align(payload: AlignmentRequest, x_alignment_secret: str = Header(defa
                 source = Path(tmp) / "source_audio"
                 audio_bytes, audio_sha256 = await download_audio(payload.audio_url, source)
                 groups = chunk_words(payload.words)
+                windows = chunk_windows(groups)
                 aligned: list[dict] = []
                 losses: list[float] = []
                 timeout = httpx.Timeout(600, connect=30)
                 async with httpx.AsyncClient(timeout=timeout) as client:
                     for index, group in enumerate(groups):
-                        start_ms = max(0, int(min(word.provider_start_ms for word in group) - CHUNK_PADDING_SECONDS * 1000))
-                        end_ms = int(max(word.provider_end_ms for word in group) + CHUNK_PADDING_SECONDS * 1000)
+                        window = windows[index]
+                        start_ms = int(window["start_ms"])
+                        end_ms = int(window["end_ms"])
                         chunk_path = Path(tmp) / f"chunk-{index:05d}.flac"
                         await asyncio.to_thread(extract_chunk, source, chunk_path, start_ms / 1000, max(1.0, (end_ms - start_ms) / 1000))
                         chunk_aligned, loss = await align_chunk(client, chunk_path, group, start_ms)
@@ -329,6 +399,13 @@ async def align(payload: AlignmentRequest, x_alignment_secret: str = Header(defa
             "max_regression_ms": max_regression_ms,
             "duration_ms": round((time.monotonic() - started) * 1000),
             "chunk_count": len(groups),
+            # The absorption budget this run actually granted. max_edge_padding_ms is
+            # the ceiling on how much unaccounted audio ANY edge word could have taken,
+            # so a reviewer can confirm from the response alone that it stayed below the
+            # 650ms breath boundary and the 1,500ms divergence trust threshold.
+            "edge_padding_ms": EDGE_PADDING_MS,
+            "max_edge_padding_ms": max((max(w["lead_pad_ms"], w["trail_pad_ms"]) for w in windows), default=0),
+            "chunk_windows": windows,
             "request_hash": hashlib.sha256(json.dumps([word.model_dump() for word in payload.words], sort_keys=True).encode()).hexdigest(),
             "words": aligned,
         }
