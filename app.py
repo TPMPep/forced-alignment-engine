@@ -17,10 +17,10 @@ from services.expansion import (
     NEIGHBOUR_GUARD_MS,
     detect_saturation,
     expansion_plan,
-    unresolved_words,
+    unresolved_reasons,
 )
 
-BUILD_TAG = "2026-08-15-elevenlabs-forced-alignment-v7-adaptive-search-expansion"
+BUILD_TAG = "2026-08-16-elevenlabs-forced-alignment-v8-per-word-expansion-attribution"
 # Policy generation of the ADAPTIVE SEARCH EXPANSION behaviour, pinned onto every
 # response so a delivered alignment is never reinterpreted under later rules.
 # v1 = provider window is a hard limit (circular timing: the ASR proposes the
@@ -29,7 +29,15 @@ BUILD_TAG = "2026-08-15-elevenlabs-forced-alignment-v7-adaptive-search-expansion
 #      expanded on multi-signal evidence, bounded by neighbouring speech, and a
 #      region that still cannot place its words is reported UNRESOLVED rather
 #      than accepted.
-EXPANSION_POLICY_VERSION = 2
+# v3 = PER-WORD attribution. Every returned word carries the chunk it came from,
+#      the pass that produced it, and the expansion granted to each edge of its
+#      search region, plus a machine-readable reason on every unresolved word.
+#      Run-level totals alone forced the consumer to INFER which words an
+#      expansion affected, and an inferred attribution is not evidence — it is a
+#      guess that happens to be checkable. Unresolved words are also judged
+#      against the same evidence-relative ceiling the downstream arbitration
+#      uses, so the two stages cannot disagree about what "possible" means.
+EXPANSION_POLICY_VERSION = 3
 PROVIDER = "elevenlabs_forced_alignment"
 PROVIDER_API = "https://api.elevenlabs.io/v1/forced-alignment"
 MAX_WORDS = int(os.getenv("ALIGNMENT_MAX_WORDS", "50000"))
@@ -408,17 +416,27 @@ async def align_group_adaptively(
         lead_extra += plan["lead_expansion_ms"]
         trail_extra += plan["trail_expansion_ms"]
 
-    unresolved = set(unresolved_words(aligned, effective, edges))
+    reasons = unresolved_reasons(aligned, effective, edges)
     exhausted_keys = set()
     for side in ("lead", "trail"):
         if edges.get(side, {}).get("exhausted"):
             exhausted_keys.update(edges[side].get("word_keys") or [])
+    # PER-WORD ATTRIBUTION (policy v3). Stamped on EVERY word, resolved or not, so
+    # a downstream consumer can attribute an expansion to the exact words it
+    # affected instead of inferring it from chunk totals.
     for word in aligned:
         key = str(word["key"])
+        word["chunk_index"] = index
+        word["alignment_pass"] = len(passes)
+        word["expansion_lead_ms"] = round(lead_extra)
+        word["expansion_trail_ms"] = round(trail_extra)
+        word["search_window_start_ms"] = round(float(effective["start_ms"]))
+        word["search_window_end_ms"] = round(float(effective["end_ms"]))
         if key in exhausted_keys:
             word["search_window_exhausted"] = True
-        if key in unresolved:
+        if key in reasons:
             word["unresolved"] = True
+            word["unresolved_reason"] = reasons[key]
 
     return {
         "aligned": aligned,
@@ -429,7 +447,8 @@ async def align_group_adaptively(
         "trail_expansion_ms": round(trail_extra),
         "final_window_start_ms": round(float(effective["start_ms"])),
         "final_window_end_ms": round(float(effective["end_ms"])),
-        "unresolved_keys": sorted(unresolved),
+        "unresolved_keys": sorted(reasons.keys()),
+        "unresolved_reasons": reasons,
     }
 
 
@@ -589,7 +608,16 @@ async def align(payload: AlignmentRequest, x_alignment_secret: str = Header(defa
             "cross_chunk_overlaps": overlaps,
             "unresolved_word_count": sum(1 for word in aligned if word.get("unresolved")),
             "unresolved_sample": [
-                {"key": str(word["key"]), "text": str(word["text"]), "start_ms": word["start_ms"], "end_ms": word["end_ms"]}
+                {
+                    "key": str(word["key"]),
+                    "text": str(word["text"]),
+                    "start_ms": word["start_ms"],
+                    "end_ms": word["end_ms"],
+                    "reason": word.get("unresolved_reason"),
+                    "chunk_index": word.get("chunk_index"),
+                    "alignment_pass": word.get("alignment_pass"),
+                    "expansion_trail_ms": word.get("expansion_trail_ms"),
+                }
                 for word in aligned if word.get("unresolved")
             ][:MAX_OUTLIER_SAMPLE],
             "chunk_windows": windows,
