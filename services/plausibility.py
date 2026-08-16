@@ -51,13 +51,68 @@ def typical_word_duration_ms(text: str) -> float:
     return visible_chars(text) * WORD_MS_PER_CHAR
 
 
-def window_plausible(text: str, start_ms: float, end_ms: float) -> bool:
-    """Is this window a physically possible utterance of `text`?"""
+def provider_capture_credible(text: str, provider_duration_ms: float | None) -> bool:
+    """Is the PROVIDER's measured duration credible as a reading of this text?
+
+    Mirrors providerCaptureCredible in bullmq-worker/src/timeline-integrity.ts. A
+    capture more than WORD_DURATION_SAFETY_FACTOR times faster than conversational
+    pace is not a measurement of that word — it is a compressed or collapsed
+    timestamp, which is precisely the case the aligner is expected to correct. The
+    same safety factor bounds both directions so there is one documented tolerance.
+    """
+    if provider_duration_ms is None:
+        return False
+    try:
+        duration = float(provider_duration_ms)
+    except (TypeError, ValueError):
+        return False
+    if duration < MIN_PLAUSIBLE_WORD_MS:
+        return False
+    return duration >= typical_word_duration_ms(text) / WORD_DURATION_SAFETY_FACTOR
+
+
+def evidence_ceiling_ms(text: str, provider_duration_ms: float | None) -> float:
+    """Upper bound an ALIGNED window must respect given this word's evidence.
+
+    Mirrors evidenceCeilingMs in the worker. The generic rate ceiling alone cannot
+    detect absorption, because its floor grants every short word a 1,500ms
+    allowance; a credible provider capture supplies the independent, word-specific
+    bound. Degrades to the rate ceiling whenever no credible capture exists, so a
+    too-short capture can never stop the aligner from correcting it.
+    """
+    rate_ceiling = max_word_duration_ms(text)
+    if not provider_capture_credible(text, provider_duration_ms):
+        return rate_ceiling
+    return min(rate_ceiling, round(float(provider_duration_ms) * WORD_DURATION_SAFETY_FACTOR + MIN_PLAUSIBLE_WORD_MS))
+
+
+def near_zero_corroborated(provider_duration_ms: float | None) -> bool:
+    """Is a sub-floor aligned window corroborated as a genuinely brief word?
+
+    Mirrors nearZeroCorroborated in the worker. A sub-floor duration is evidence
+    of real (clipped) speech only when the other timeline independently reports a
+    comparably brief word.
+    """
+    if provider_duration_ms is None:
+        return False
+    try:
+        duration = float(provider_duration_ms)
+    except (TypeError, ValueError):
+        return False
+    return 0 < duration <= MIN_PLAUSIBLE_WORD_MS * WORD_DURATION_SAFETY_FACTOR
+
+
+def window_plausible(text: str, start_ms: float, end_ms: float, provider_duration_ms: float | None = None) -> bool:
+    """Is this window a physically possible utterance of `text`?
+
+    `provider_duration_ms` supplies the evidence-relative upper bound. Pass None
+    when judging the provider's own window — a measurement cannot bound itself.
+    """
     try:
         duration = float(end_ms) - float(start_ms)
     except (TypeError, ValueError):
         return False
-    return MIN_PLAUSIBLE_WORD_MS <= duration <= max_word_duration_ms(text)
+    return MIN_PLAUSIBLE_WORD_MS <= duration <= evidence_ceiling_ms(text, provider_duration_ms)
 
 
 def required_span_ms(texts: list[str]) -> float:
