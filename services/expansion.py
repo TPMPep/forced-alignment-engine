@@ -60,6 +60,7 @@ reported as such, and the arbitration restores the safer evidence.
 
 from .plausibility import (
     MIN_PLAUSIBLE_WORD_MS,
+    evidence_ceiling_ms,
     max_word_duration_ms,
     required_span_ms,
 )
@@ -227,20 +228,44 @@ def expansion_plan(window: dict, edges: dict, pass_number: int) -> dict:
     return plan
 
 
-def unresolved_words(aligned: list[dict], window: dict, edges: dict) -> list[str]:
-    """Words that STILL have no credible acoustic placement after the final pass.
+def unresolved_reasons(aligned: list[dict], window: dict, edges: dict) -> dict[str, str]:
+    """Words with no credible placement after the final pass, each with its REASON.
 
-    Fail-safe input: these are never presented as valid timing. A word qualifies
-    when it sits in an exhausted boundary run, or when its window is not a
-    physically possible utterance of its own text.
+    Fail-safe: these are never presented as valid timing. A word qualifies when it
+    sits in an exhausted boundary run, or when its window is not a physically
+    possible utterance of its own text — judged against the same evidence-relative
+    ceiling the downstream arbitration uses, so the two stages cannot disagree
+    about what "possible" means.
+
+    The reason is carried per word because a count alone is unactionable: an
+    operator handed "1 unresolved word" cannot tell which word failed or why.
     """
-    keys: set[str] = set()
+    reasons: dict[str, str] = {}
     for side in ("lead", "trail"):
         edge = edges.get(side) or {}
         if edge.get("exhausted"):
-            keys.update(edge.get("word_keys") or [])
+            for key in edge.get("word_keys") or []:
+                reasons[str(key)] = f"search_region_exhausted_at_{side}_edge"
     for word in aligned:
+        key = str(word["key"])
         duration = float(word["end_ms"]) - float(word["start_ms"])
-        if duration < MIN_PLAUSIBLE_WORD_MS or duration > max_word_duration_ms(str(word["text"])):
-            keys.add(str(word["key"]))
-    return sorted(keys)
+        provider_duration = None
+        if word.get("provider_start_ms") is not None and word.get("provider_end_ms") is not None:
+            provider_duration = float(word["provider_end_ms"]) - float(word["provider_start_ms"])
+        if duration < MIN_PLAUSIBLE_WORD_MS:
+            reasons.setdefault(key, "aligned_window_below_evidence_floor")
+        elif duration > evidence_ceiling_ms(str(word["text"]), provider_duration):
+            reasons.setdefault(
+                key,
+                "aligned_window_inflated_beyond_evidence"
+                if provider_duration is not None
+                else "aligned_window_exceeds_rate_ceiling",
+            )
+        elif duration > max_word_duration_ms(str(word["text"])):
+            reasons.setdefault(key, "aligned_window_exceeds_rate_ceiling")
+    return reasons
+
+
+def unresolved_words(aligned: list[dict], window: dict, edges: dict) -> list[str]:
+    """Keys only, for callers that do not need the reasons."""
+    return sorted(unresolved_reasons(aligned, window, edges).keys())
