@@ -20,7 +20,7 @@ from services.expansion import (
     unresolved_reasons,
 )
 
-BUILD_TAG = "2026-08-16-elevenlabs-forced-alignment-v8-per-word-expansion-attribution"
+BUILD_TAG = "2026-08-16-elevenlabs-forced-alignment-v9-stack-detection-anywhere-in-run"
 # Policy generation of the ADAPTIVE SEARCH EXPANSION behaviour, pinned onto every
 # response so a delivered alignment is never reinterpreted under later rules.
 # v1 = provider window is a hard limit (circular timing: the ASR proposes the
@@ -37,7 +37,20 @@ BUILD_TAG = "2026-08-16-elevenlabs-forced-alignment-v8-per-word-expansion-attrib
 #      guess that happens to be checkable. Unresolved words are also judged
 #      against the same evidence-relative ceiling the downstream arbitration
 #      uses, so the two stages cannot disagree about what "possible" means.
-EXPANSION_POLICY_VERSION = 3
+# v4 = the stacked_at_edge signal is detected ANYWHERE inside a boundary run, not
+#      only when EVERY word in the run shares one window. The old rule silently
+#      suppressed the strongest, most diagnostic saturation signal whenever a
+#      neighbouring word merely TOUCHED the slice edge and joined the run: on
+#      project 6a7d874aa2ddd372f426a4df line 18 the word "key" ends 28ms from the
+#      edge — inside EDGE_PROXIMITY_MS — so the five-word stack behind it (all at
+#      93,986→93,987) was never reported. Exhaustion was still declared there on
+#      four other signals, so no shipped verdict was wrong; but on a shorter run
+#      the lost signal is the difference between reaching the two required signals
+#      and silently skipping an expansion the words genuinely needed. Pinned as
+#      its own generation because a run delivered under v3 reported a DIFFERENT
+#      signal set for identical audio, and an auditor must read the evidence
+#      against the rules that produced it.
+EXPANSION_POLICY_VERSION = 4
 PROVIDER = "elevenlabs_forced_alignment"
 PROVIDER_API = "https://api.elevenlabs.io/v1/forced-alignment"
 MAX_WORDS = int(os.getenv("ALIGNMENT_MAX_WORDS", "50000"))
