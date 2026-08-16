@@ -38,13 +38,25 @@ class EdgePaddingTests(unittest.TestCase):
         self.assertLessEqual(EDGE_PADDING_FLOOR_MS, EDGE_PADDING_MS)
 
     def test_pad_never_exceeds_half_the_measured_silence(self):
-        # A 900ms measured gap may spend at most 450ms per side, so two adjacent
-        # chunks can never pad into the same silence or into each other's speech.
+        # A 900ms measured gap may spend AT MOST half (450ms) per side, so two
+        # adjacent chunks can never pad into the same silence or into each other's
+        # speech. BOTH bounds apply and the tighter one wins: the pad is
+        # min(EDGE_PADDING_MS, half the gap), floored. At a 900ms gap the 350ms cap
+        # is tighter than the 450ms half-gap, so 350 is the correct answer — an
+        # earlier revision of this test asserted 450 and was simply wrong about the
+        # rule. The invariant that actually matters (never more than half) is
+        # asserted directly rather than inferred from one arithmetic result, so this
+        # keeps failing loudly if EITHER bound is ever loosened.
         groups = [[word("a:0", 0, 1_000)], [word("b:0", 1_900, 2_500)]]
         first, second = chunk_windows(groups)
+        half_gap = 450
+        expected = min(EDGE_PADDING_MS, half_gap)
         self.assertEqual(first["trail_gap_ms"], 900)
-        self.assertEqual(first["trail_pad_ms"], 450)
-        self.assertEqual(second["lead_pad_ms"], 450)
+        self.assertEqual(first["trail_pad_ms"], expected)
+        self.assertEqual(second["lead_pad_ms"], expected)
+        self.assertLessEqual(first["trail_pad_ms"], half_gap)
+        self.assertLessEqual(second["lead_pad_ms"], half_gap)
+        # The two windows still cannot meet inside the measured silence.
         self.assertLessEqual(first["end_ms"], second["start_ms"])
 
     def test_wide_silence_is_capped_not_consumed(self):
