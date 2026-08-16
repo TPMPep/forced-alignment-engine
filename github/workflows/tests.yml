@@ -1,0 +1,48 @@
+# =============================================================================
+# CI — forced-alignment engine policy tests.
+# -----------------------------------------------------------------------------
+# MUST live at .github/workflows/tests.yml in the ROOT of the engine repo.
+# GitHub only reads workflows from the repository root; a workflow nested in a
+# subdirectory is silently ignored, which is exactly how this repo ended up with
+# no test CI at all while appearing to have a suite.
+#
+# What it guards, and why each matters:
+#   • test_plausibility_parity.py — locks the engine's speech-plausibility
+#     constants against the worker's timeline-integrity source. A drift means the
+#     engine expands a search window to place words the downstream audit then
+#     rejects — two stages disagreeing about what "physically possible speech" is.
+#   • test_per_word_attribution.py — proves every returned word carries its own
+#     chunk, pass, edge expansions and unresolved reason, so an expansion is
+#     never inferred from chunk totals.
+#   • test_expansion_policy.py / test_edge_padding.py / test_timeline_policy.py /
+#     test_shift_distribution.py — the adaptive-expansion and absorption bounds.
+# =============================================================================
+
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  policy-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest
+
+      - name: Run policy tests
+        run: pytest tests -v
