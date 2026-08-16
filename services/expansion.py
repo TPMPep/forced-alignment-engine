@@ -136,12 +136,29 @@ def detect_saturation(aligned: list[dict], window: dict, confidence: float) -> d
             continue
 
         run_words = [aligned[index] for index in run]
+        # A stack ANYWHERE inside the boundary run is evidence — it does not require
+        # every word in the run to share the window. Demanding that suppressed the
+        # signal precisely where the defect is most severe: on project
+        # 6a7d874aa2ddd372f426a4df line 18 the word "key" ends 28ms from the slice
+        # edge, inside EDGE_PROXIMITY_MS, so it legitimately joins the run — and the
+        # five-word stack sitting behind it (all at 93,986→93,987) then went
+        # unreported, because that one non-stacked member failed the all() test.
+        # Exhaustion was still declared there on four other signals, so no verdict
+        # was wrong; but on a shorter run this is the difference between finding the
+        # second required signal and silently skipping a needed expansion.
+        # This can never fire on a healthy run: it needs STACK_MIN_WORDS words whose
+        # start AND end agree to within STACK_TOLERANCE_MS (5ms), which is a
+        # degenerate aligner output by construction, not fast speech.
         if len(run) >= STACK_MIN_WORDS:
-            first = run_words[0]
-            stacked = all(
-                abs(float(w["start_ms"]) - float(first["start_ms"])) <= STACK_TOLERANCE_MS
-                and abs(float(w["end_ms"]) - float(first["end_ms"])) <= STACK_TOLERANCE_MS
-                for w in run_words
+            stacked = any(
+                sum(
+                    1
+                    for other in run_words
+                    if abs(float(other["start_ms"]) - float(anchor["start_ms"])) <= STACK_TOLERANCE_MS
+                    and abs(float(other["end_ms"]) - float(anchor["end_ms"])) <= STACK_TOLERANCE_MS
+                )
+                >= STACK_MIN_WORDS
+                for anchor in run_words
             )
             if stacked:
                 signals.append("stacked_at_edge")
