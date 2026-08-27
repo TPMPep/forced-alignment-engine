@@ -19,8 +19,26 @@ from services.expansion import (
     expansion_plan,
     unresolved_reasons,
 )
+from services.token_reconcile import reconcile_returned_words
 
-BUILD_TAG = "2026-08-16-elevenlabs-forced-alignment-v9-stack-detection-anywhere-in-run"
+BUILD_TAG = "2026-08-27-elevenlabs-forced-alignment-v10-provider-tokenization-reconciliation"
+# Policy generation of how the PROVIDER'S OWN TOKENIZATION is reconciled with the
+# tokens we submit. Pinned on every response because a delivered word window must
+# be readable against the rule that produced it.
+# v1 = positional 1:1. The provider was assumed to return exactly one word per
+#      submitted token, so the two lists were zipped and a count difference was a
+#      hard 422. True only for space-delimited scripts: ElevenLabs re-tokenizes the
+#      transcript by its own morphology, so Japanese, Chinese and every other
+#      space-free script failed outright (project 6a7d8758ce3722efa0a0c73a: 89
+#      tokens submitted, 112 words returned, Duo verification impossible).
+# v2 = CHARACTER-STREAM reconciliation (services/token_reconcile.py). The two
+#      tokenizations are matched on the alignable characters they describe, which
+#      is a stricter identity check than the per-token comparison it replaces. A
+#      token the provider split takes its measured first-start-to-last-end window;
+#      tokens the provider merged subdivide the shared window proportionally and
+#      are DISCLOSED as estimated. Space-delimited runs resolve one-to-one and are
+#      bit-for-bit unchanged.
+TOKENIZATION_POLICY_VERSION = 2
 # Policy generation of the ADAPTIVE SEARCH EXPANSION behaviour, pinned onto every
 # response so a delivered alignment is never reinterpreted under later rules.
 # v1 = provider window is a hard limit (circular timing: the ASR proposes the
@@ -339,18 +357,26 @@ async def align_chunk(client: httpx.AsyncClient, audio_path: Path, words: list[I
         raise ValueError(f"ElevenLabs forced alignment rejected chunk: {response.text[:500]}")
     body = response.json()
     raw_words = [item for item in body.get("words", []) if str(item.get("text", "")).strip()]
-    if len(raw_words) != len(words):
-        raise ValueError(f"Alignment word-count mismatch: expected {len(words)}, received {len(raw_words)}")
+    # TOKENIZATION POLICY v2 — the provider tokenizes the transcript itself, so its
+    # word count is reconciled against ours on the CHARACTER STREAM rather than
+    # assumed equal. Still fails closed (ValueError -> 422) when the streams prove
+    # the provider aligned something other than what we submitted.
+    plan = reconcile_returned_words([word.text for word in words], raw_words)
     loss = float(body.get("loss", 0.0) or 0.0)
     confidence = max(0.0, min(1.0, 1.0 - loss))
     aligned = []
-    for expected, actual in zip(words, raw_words):
-        if normalized_token(expected.text) != normalized_token(str(actual.get("text", ""))):
-            raise ValueError(f"Alignment token mismatch at {expected.key}")
-        start_ms = offset_ms + round(float(actual["start"]) * 1000)
-        end_ms = offset_ms + round(float(actual["end"]) * 1000)
+    for expected, window in zip(words, plan):
+        start_ms = offset_ms + round(window["start"] * 1000)
+        end_ms = offset_ms + round(window["end"] * 1000)
         if end_ms <= start_ms:
-            raise ValueError(f"Invalid alignment window at {expected.key}")
+            # A reconciled window can round to zero width (a merged sub-token, or a
+            # punctuation-only token placed at a seam). Those are DERIVED windows and
+            # are already disclosed as estimated, so they are widened to the minimum
+            # representable span. A window the provider itself MEASURED as zero-width
+            # is still an integrity failure and still raises.
+            if not window["estimated"]:
+                raise ValueError(f"Invalid alignment window at {expected.key}")
+            end_ms = start_ms + 1
         aligned.append({
             "key": expected.key,
             "text": expected.text,
@@ -359,6 +385,8 @@ async def align_chunk(client: httpx.AsyncClient, audio_path: Path, words: list[I
             "confidence": confidence,
             "provider_start_ms": expected.provider_start_ms,
             "provider_end_ms": expected.provider_end_ms,
+            **({"token_window_estimated": True} if window["estimated"] else {}),
+            "returned_word_count": window["returned_word_count"],
         })
     return aligned, loss
 
@@ -515,6 +543,7 @@ async def health():
         "edge_padding_ms": EDGE_PADDING_MS,
         "edge_padding_floor_ms": EDGE_PADDING_FLOOR_MS,
         "expansion_policy_version": EXPANSION_POLICY_VERSION,
+        "tokenization_policy_version": TOKENIZATION_POLICY_VERSION,
         "max_expansion_passes": MAX_EXPANSION_PASSES,
         "neighbour_guard_ms": NEIGHBOUR_GUARD_MS,
         "supported_language_count": len(SUPPORTED_LANGUAGES),
@@ -605,6 +634,12 @@ async def align(payload: AlignmentRequest, x_alignment_secret: str = Header(defa
             # treated as fully verified timing: those words are surfaced for review
             # instead of being accepted at a slice edge.
             "expansion_policy_version": EXPANSION_POLICY_VERSION,
+            # Tokenization reconciliation evidence. estimated_window_count is the
+            # number of words whose window was DERIVED by subdividing a returned
+            # word the provider had merged, so a reviewer can tell measured timing
+            # from derived timing without re-deriving either.
+            "tokenization_policy_version": TOKENIZATION_POLICY_VERSION,
+            "estimated_window_count": sum(1 for word in aligned if word.get("token_window_estimated")),
             "max_expansion_passes": MAX_EXPANSION_PASSES,
             "neighbour_guard_ms": NEIGHBOUR_GUARD_MS,
             "alignment_pass_count": sum(int(w.get("pass_count", 1)) for w in windows),
