@@ -1,166 +1,118 @@
-"""Reconcile the provider's OWN tokenization back onto our input tokens.
+"""Tokenization-reconciliation contract (tokenization policy v2).
 
-WHY THIS EXISTS (root cause, not a loosened check)
---------------------------------------------------
-`align_chunk` sends one transcript string built by joining our input tokens with
-spaces, and then assumed the provider returns exactly one word per input token,
-in order, so it could `zip()` the two lists. That assumption is only true for
-space-delimited languages.
-
-ElevenLabs forced alignment re-tokenizes the transcript it is given. For Japanese
-(and Chinese, and any script written without spaces) it segments by its own
-morphology and ignores the spaces we inserted, so the returned word count has no
-relationship to ours. Ground truth, project 6a7d8758ce3722efa0a0c73a
-(source_language 'ja', 2026-08-27): 89 input tokens produced 112 returned words,
-the count guard raised, the engine answered HTTP 422, and Duo verification failed
-outright — meaning dual-model consensus was structurally impossible for Japanese
-content, not merely unreliable.
-
-Two rejected alternatives, and why:
-  * DROP THE COUNT GUARD and zip anyway — that silently pairs word N of our
-    transcript with an unrelated word N of theirs. It is the worst outcome
-    available: every timing would be wrong and nothing would report it.
-  * SEND ONE ALIGNMENT CALL PER TOKEN — correct in principle, but it multiplies a
-    paid provider call by the word count (thousands per programme) and destroys
-    the chunk-level acoustic context alignment depends on.
-
-So the provider's tokenization is treated as WHAT IT ACTUALLY IS: an independent
-segmentation of the same character stream. The reconciliation below is a pure,
-deterministic mapping between the two segmentations, keyed on the characters
-themselves — never on counts, never on positions.
-
-THE CONTRACT
-------------
-The alignable characters of our tokens, concatenated in order, MUST equal the
-alignable characters of the returned words, concatenated in order. That identity
-is a STRICTER guarantee than the old per-token comparison it replaces: it proves
-the provider aligned our transcript and nothing else. If the streams differ the
-function raises and the run still fails closed — the failure mode is preserved,
-only the false positive is removed.
-
-Given that identity, each input token's window is derived from the returned words
-that carry ITS characters:
-  * one returned word per token (the space-delimited case) -> the window is that
-    word's window, byte-for-byte identical to the previous behaviour, so no
-    English/European run changes at all;
-  * several returned words per token (a token the provider split) -> first start
-    to last end, which is measured, not estimated;
-  * one returned word spanning several tokens (tokens the provider merged) -> the
-    shared window is subdivided in proportion to each token's character count.
-    That is a DERIVED value, so it is disclosed per word as
-    `token_window_estimated` and counted on the response, because a derived
-    timing that is indistinguishable from a measured one is exactly the kind of
-    silent fiction this pipeline refuses to ship.
-
-Windows are clamped non-decreasing, so a reconciled timeline can never hand the
-downstream normalizer a regression it would have to repair.
+The Japanese Duo failure this closes: 89 submitted tokens, 112 returned words,
+HTTP 422, dual-model consensus impossible for every space-free script. These tests
+pin BOTH halves of the fix — that space-delimited runs are unchanged, and that the
+fail-closed behaviour survives.
 """
 
-# Tokens carrying no alignable character (a standalone Japanese "。", a stray
-# dash) have no speech of their own. They are placed at the seam of their
-# neighbours with this nominal width rather than being dropped, because dropping
-# an input token would break the 1:1 output contract the caller depends on.
-PUNCTUATION_WINDOW_SECONDS = 0.001
+import pytest
+
+from services.token_reconcile import alignable_chars, reconcile_returned_words
 
 
-def alignable_chars(text: str) -> str:
-    """The characters forced alignment can actually anchor on.
+def word(text, start, end):
+    return {"text": text, "start": start, "end": end}
 
-    Deliberately identical in spirit to app.normalized_token (casefolded
-    alphanumerics only): punctuation and spacing are presentation, and the two
-    tokenizers are free to disagree about them without that being an error.
+
+def test_one_to_one_is_byte_for_byte_unchanged():
+    """A space-delimited run must resolve to exactly the provider's own windows.
+
+    This is the regression guard on every existing English/European programme: the
+    reconciliation may not perturb a single millisecond where the two tokenizations
+    already agree, and nothing may be reported as estimated.
     """
-    return "".join(ch.casefold() for ch in str(text or "") if ch.isalnum())
-
-
-def _mismatch_detail(expected_stream: str, returned_stream: str) -> str:
-    limit = min(len(expected_stream), len(returned_stream))
-    position = next((i for i in range(limit) if expected_stream[i] != returned_stream[i]), limit)
-    return (
-        f"Alignment character-stream mismatch at character {position}: "
-        f"expected {len(expected_stream)} alignable characters, received {len(returned_stream)}"
+    plan = reconcile_returned_words(
+        ["This", "program", "is", "presented"],
+        [word("This", 0.0, 0.30), word("program", 0.31, 0.90), word("is", 0.91, 1.00), word("presented", 1.01, 1.80)],
     )
+    assert [(p["start"], p["end"]) for p in plan] == [(0.0, 0.30), (0.31, 0.90), (0.91, 1.00), (1.01, 1.80)]
+    assert not any(p["estimated"] for p in plan)
 
 
-def reconcile_returned_words(expected_texts: list[str], returned_words: list[dict]) -> list[dict]:
-    """Map provider-returned windows onto our input tokens, one window per token.
+def test_provider_split_takes_measured_span():
+    """A token the provider split is MEASURED, not estimated: first start, last end."""
+    plan = reconcile_returned_words(
+        ["よろしくお願いいたします"],
+        [word("よろしく", 1.0, 1.5), word("お願い", 1.5, 2.0), word("いたします", 2.0, 2.6)],
+    )
+    assert plan[0]["start"] == 1.0
+    assert plan[0]["end"] == 2.6
+    assert plan[0]["estimated"] is False
+    assert plan[0]["returned_word_count"] == 3
 
-    `returned_words` items carry `text`, `start`, `end` (seconds, provider units).
-    Returns one dict per entry of `expected_texts`: {start, end, estimated,
-    returned_word_count}. Raises ValueError when the two character streams are not
-    the same stream — the fail-closed path.
+
+def test_provider_merge_subdivides_and_discloses():
+    """Tokens the provider merged share one window, split by character count.
+
+    The subdivision is a derived value, so both halves must be flagged estimated —
+    a derived window that looks measured is the failure this discloses.
     """
-    expected_chars = [alignable_chars(text) for text in expected_texts]
-    carriers = []
-    for word in returned_words:
-        chars = alignable_chars(word.get("text"))
-        if not chars:
-            # A punctuation-only returned word anchors nothing; its time belongs to
-            # the neighbouring speech and is absorbed by the windows around it.
-            continue
-        carriers.append({
-            "chars": chars,
-            "start": float(word["start"]),
-            "end": float(word["end"]),
-        })
+    plan = reconcile_returned_words(["あい", "うえお"], [word("あいうえお", 0.0, 1.0)])
+    assert plan[0]["estimated"] is True and plan[1]["estimated"] is True
+    assert plan[0]["start"] == 0.0
+    assert plan[0]["end"] == pytest.approx(0.4)
+    assert plan[1]["start"] == pytest.approx(0.4)
+    assert plan[1]["end"] == 1.0
 
-    expected_stream = "".join(expected_chars)
-    returned_stream = "".join(carrier["chars"] for carrier in carriers)
-    if expected_stream != returned_stream:
-        raise ValueError(_mismatch_detail(expected_stream, returned_stream))
-    if not expected_stream:
-        raise ValueError("Alignment chunk carries no alignable characters")
 
-    windows: list[dict] = []
-    carrier_index = 0
-    char_offset = 0
-    cursor = carriers[0]["start"]
+def test_japanese_count_divergence_no_longer_fails():
+    """The exact production shape: more returned words than submitted tokens."""
+    plan = reconcile_returned_words(
+        ["私は", "長崎大学病院の", "高岡と申します"],
+        [
+            word("私", 0.0, 0.2), word("は", 0.2, 0.3),
+            word("長崎", 0.3, 0.7), word("大学", 0.7, 1.1), word("病院", 1.1, 1.5), word("の", 1.5, 1.6),
+            word("高岡", 1.6, 2.0), word("と", 2.0, 2.1), word("申します", 2.1, 2.8),
+        ],
+    )
+    assert len(plan) == 3
+    assert (plan[0]["start"], plan[0]["end"]) == (0.0, 0.3)
+    assert (plan[2]["start"], plan[2]["end"]) == (1.6, 2.8)
 
-    for chars in expected_chars:
-        if not chars:
-            windows.append({
-                "start": cursor,
-                "end": cursor + PUNCTUATION_WINDOW_SECONDS,
-                "estimated": True,
-                "returned_word_count": 0,
-            })
-            continue
 
-        remaining = len(chars)
-        start = None
-        end = None
-        estimated = False
-        touched = 0
-        while remaining > 0:
-            carrier = carriers[carrier_index]
-            available = len(carrier["chars"]) - char_offset
-            consumed = min(remaining, available)
-            span = carrier["end"] - carrier["start"]
-            total = len(carrier["chars"])
-            partial = consumed < total
-            # Proportional subdivision of a SHARED returned word. Only reached when
-            # the provider merged several of our tokens into one of its own.
-            portion_start = carrier["start"] + (span * (char_offset / total))
-            portion_end = carrier["start"] + (span * ((char_offset + consumed) / total))
-            if start is None:
-                start = portion_start
-            end = portion_end
-            estimated = estimated or partial
-            touched += 1
-            remaining -= consumed
-            char_offset += consumed
-            if char_offset >= total:
-                carrier_index += 1
-                char_offset = 0
+def test_punctuation_only_tokens_are_ignored_on_both_sides():
+    """Punctuation anchors nothing; the two tokenizers may disagree about it freely."""
+    plan = reconcile_returned_words(
+        ["します。", "はい"],
+        [word("します", 0.0, 0.5), word("。", 0.5, 0.5), word("はい", 0.6, 0.9)],
+    )
+    assert (plan[0]["start"], plan[0]["end"]) == (0.0, 0.5)
+    assert (plan[1]["start"], plan[1]["end"]) == (0.6, 0.9)
 
-        start = max(start, cursor)
-        end = max(end, start + PUNCTUATION_WINDOW_SECONDS)
-        cursor = end
-        windows.append({
-            "start": start,
-            "end": end,
-            "estimated": estimated,
-            "returned_word_count": touched,
-        })
 
-    return windows
+def test_token_with_no_alignable_characters_still_gets_a_window():
+    """The 1:1 output contract holds even for a token carrying no speech."""
+    plan = reconcile_returned_words(["はい", "。", "どうぞ"], [word("はい", 0.0, 0.4), word("どうぞ", 0.5, 1.0)])
+    assert len(plan) == 3
+    assert plan[1]["estimated"] is True
+    assert plan[1]["end"] > plan[1]["start"]
+    assert plan[2]["start"] == 0.5
+
+
+def test_different_transcript_still_fails_closed():
+    """The whole safety value: a provider that aligned other text must still raise."""
+    with pytest.raises(ValueError) as error:
+        reconcile_returned_words(["hello", "world"], [word("hello", 0.0, 0.4), word("planet", 0.4, 0.9)])
+    assert "character-stream mismatch" in str(error.value)
+
+
+def test_truncated_provider_result_still_fails_closed():
+    with pytest.raises(ValueError):
+        reconcile_returned_words(["hello", "world"], [word("hello", 0.0, 0.4)])
+
+
+def test_windows_never_regress():
+    """Reconciled output is monotonic, so the normalizer is never handed a regression."""
+    plan = reconcile_returned_words(
+        ["one", "two", "three"],
+        [word("one", 1.0, 1.4), word("two", 0.9, 1.2), word("three", 1.5, 2.0)],
+    )
+    starts = [p["start"] for p in plan]
+    assert starts == sorted(starts)
+    assert plan[1]["end"] >= plan[1]["start"]
+
+
+def test_alignable_chars_matches_normalized_token_semantics():
+    assert alignable_chars("Med-scape,") == "medscape"
+    assert alignable_chars("。") == ""
