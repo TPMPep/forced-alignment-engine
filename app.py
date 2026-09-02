@@ -21,7 +21,7 @@ from services.expansion import (
 )
 from services.token_reconcile import reconcile_returned_words
 
-BUILD_TAG = "2026-08-27-elevenlabs-forced-alignment-v10-provider-tokenization-reconciliation"
+BUILD_TAG = "2026-09-02-approved-script-untimed-alignment"
 # Policy generation of how the PROVIDER'S OWN TOKENIZATION is reconciled with the
 # tokens we submit. Pinned on every response because a delivered word window must
 # be readable against the rule that produced it.
@@ -157,6 +157,7 @@ class AlignmentRequest(BaseModel):
     request_id: str = Field(min_length=1, max_length=200)
     audio_url: str = Field(min_length=8)
     language_code: str = Field(min_length=2, max_length=8)
+    alignment_mode: str = Field(default="provider_timed", pattern="^(provider_timed|untimed_script)$")
     words: list[InputWord] = Field(min_length=1)
 
 
@@ -186,7 +187,9 @@ async def download_audio(url: str, target: Path) -> tuple[int, str]:
     return total, digest.hexdigest()
 
 
-def chunk_words(words: list[InputWord]) -> list[list[InputWord]]:
+def chunk_words(words: list[InputWord], alignment_mode: str = "provider_timed") -> list[list[InputWord]]:
+    if alignment_mode == "untimed_script":
+        return [words]
     chunks: list[list[InputWord]] = []
     current: list[InputWord] = []
     chars = 0
@@ -212,7 +215,7 @@ def chunk_words(words: list[InputWord]) -> list[list[InputWord]]:
     return chunks
 
 
-def chunk_windows(groups: list[list[InputWord]]) -> list[dict]:
+def chunk_windows(groups: list[list[InputWord]], alignment_mode: str = "provider_timed", audio_duration_ms: float | None = None) -> list[dict]:
     """Audio window per chunk, with each edge pad bounded by MEASURED silence.
 
     A chunk's window is the group's provider-measured speech span plus a pad on
@@ -227,6 +230,9 @@ def chunk_windows(groups: list[list[InputWord]]) -> list[dict]:
     so an auditor can reconstruct exactly how much unaccounted audio each edge
     word was exposed to, without re-deriving it from the word timings.
     """
+    if alignment_mode == "untimed_script":
+        duration = max(1.0, float(audio_duration_ms or 1.0))
+        return [{"start_ms": 0.0, "end_ms": duration, "speech_start_ms": 0.0, "speech_end_ms": duration, "lead_pad_ms": 0, "trail_pad_ms": 0, "lead_gap_ms": None, "trail_gap_ms": None, "previous_speech_end_ms": None, "next_speech_start_ms": None, "word_count": len(groups[0])}]
     windows: list[dict] = []
     for index, group in enumerate(groups):
         speech_start = min(word.provider_start_ms for word in group)
@@ -322,6 +328,17 @@ def shift_distribution(aligned: list[dict]) -> dict:
         "outlier_ratio": (len(outliers) / len(values)) if values else 0.0,
         "outlier_sample": [{"key": key, "shift_ms": value} for value, key in outliers[:MAX_OUTLIER_SAMPLE]],
     }
+
+
+def probe_audio_duration_ms(source: Path) -> int:
+    command = ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", str(source)]
+    completed = subprocess.run(command, capture_output=True, text=True, timeout=120)
+    if completed.returncode != 0:
+        raise ValueError(f"Audio duration probe failed: {completed.stderr[-300:]}")
+    duration_ms = round(float(completed.stdout.strip()) * 1000)
+    if duration_ms <= 0:
+        raise ValueError("Audio duration probe returned no usable duration")
+    return duration_ms
 
 
 def extract_chunk(source: Path, target: Path, start_seconds: float, duration_seconds: float):
@@ -565,7 +582,9 @@ async def align(payload: AlignmentRequest, x_alignment_secret: str = Header(defa
     for word in payload.words:
         segment_key = word.key.rsplit(":", 1)[0]
         previous_provider_start = provider_cursor_by_segment.get(segment_key, -1.0)
-        if word.provider_end_ms < word.provider_start_ms or word.provider_start_ms < previous_provider_start:
+        if word.provider_end_ms < word.provider_start_ms:
+            raise HTTPException(status_code=422, detail=f"Invalid input window at {word.key}")
+        if payload.alignment_mode == "provider_timed" and word.provider_start_ms < previous_provider_start:
             raise HTTPException(status_code=422, detail=f"Invalid provider timeline at {word.key}")
         provider_cursor_by_segment[segment_key] = word.provider_start_ms
     started = time.monotonic()
@@ -574,8 +593,9 @@ async def align(payload: AlignmentRequest, x_alignment_secret: str = Header(defa
             with tempfile.TemporaryDirectory(prefix="media-align-") as tmp:
                 source = Path(tmp) / "source_audio"
                 audio_bytes, audio_sha256 = await download_audio(payload.audio_url, source)
-                groups = chunk_words(payload.words)
-                windows = chunk_windows(groups)
+                audio_duration_ms = await asyncio.to_thread(probe_audio_duration_ms, source)
+                groups = chunk_words(payload.words, payload.alignment_mode)
+                windows = chunk_windows(groups, payload.alignment_mode, audio_duration_ms)
                 aligned: list[dict] = []
                 losses: list[float] = []
                 chunk_results: list[dict] = []
@@ -600,7 +620,7 @@ async def align(payload: AlignmentRequest, x_alignment_secret: str = Header(defa
         if len(aligned) != len(payload.words):
             raise ValueError("Alignment result is incomplete")
         aligned, timing_repair_count, max_regression_ms = normalize_aligned_timeline(aligned)
-        distribution = shift_distribution(aligned)
+        distribution = shift_distribution(aligned) if payload.alignment_mode == "provider_timed" else {"max_provider_shift_ms": 0, "median_provider_shift_ms": 0, "p95_provider_shift_ms": 0, "p99_provider_shift_ms": 0, "outlier_tolerance_ms": OUTLIER_TOLERANCE_MS, "outlier_word_count": 0, "outlier_ratio": 0.0, "outlier_sample": []}
         mean_loss = sum(losses) / len(losses)
         response = {
             "ok": True,
@@ -610,6 +630,8 @@ async def align(payload: AlignmentRequest, x_alignment_secret: str = Header(defa
             "model": "forced-alignment-api",
             "model_revision": f"provider-managed-unversioned:{BUILD_TAG}",
             "language_code": payload.language_code,
+            "alignment_mode": payload.alignment_mode,
+            "timing_basis": "acoustic_only" if payload.alignment_mode == "untimed_script" else "provider_timeline_reconciled",
             "audio_bytes": audio_bytes,
             "audio_sha256": audio_sha256,
             "word_count": len(aligned),
